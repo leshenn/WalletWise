@@ -42,3 +42,9 @@ Pay-cycle reports are created from transactions explicitly marked as salary; an 
 ## Wally semantic routing
 
 Wally now builds and validates a semantic query plan before answering. Ambiguous natural-language phrasing may use a tiny language-only Groq planning call with no financial data. Local answers are validated against the plan before being returned. `WALLETWISE_TRACE=true` enables the single unified routing trace.
+
+## Verified statement period / year reporting
+
+The FNB importer reads `Statement Period` from the PDF header before resolving the year for each transaction. It will reject a missing or conflicting header rather than guessing from invoice dates. Imported statements preserve the **header's actual date range** for coverage. `GET /api/reports` returns annual (`yearly`) summaries and `availableYears`, used by the Reports year selector.
+
+Use `WALLETWISE_IMPORT_DEBUG=1` in `backend/.env` only when diagnosing an import. It creates local period/table/OCR debug PDFs and date-mapping JSON under `backend/data/debug/`; these files may contain banking information. See `STATEMENT_PERIOD_YEARLY_REPORTING_UPDATE.md` for details.

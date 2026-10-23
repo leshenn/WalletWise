@@ -7,10 +7,12 @@ from datetime import date
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 
 from walletwise.exceptions import UnsupportedBankError
+from walletwise.extraction.registry import ExtractorRegistry
 from walletwise.processing import FinancialRoleService
 
 from .database import Database
@@ -107,6 +109,37 @@ app.add_middleware(
 )
 
 
+def imported_banks() -> list[str]:
+    """Only show banks with statements actually imported, not all extractor plugins."""
+    return sorted({item['bank'] for item in dataset_repository.list_statements() if item.get('bank')}, key=str.casefold)
+
+
+def resolve_bank(bank: str | None) -> str | None:
+    """Normalize an all/single/multiple bank selection for every financial endpoint."""
+    value = (bank or 'all').strip()
+    if not value or value.casefold() == 'all':
+        return None
+    parts = [part.strip() for part in value.split(',')]
+    if not parts or any(not part or part.casefold() == 'all' for part in parts):
+        raise HTTPException(status_code=400, detail='Choose valid bank names or All banks.')
+    allowed = {name.casefold(): name for name in (*ExtractorRegistry.SUPPORTED_BANKS, *imported_banks())}
+    selected = set()
+    for part in parts:
+        canonical = allowed.get(part.casefold())
+        if canonical is None:
+            raise HTTPException(status_code=400, detail=f'Unsupported bank filter: {part}')
+        selected.add(canonical)
+    return ','.join(sorted(selected, key=str.casefold))
+
+
+def bank_transactions(bank: str | None) -> list[dict]:
+    return dataset_repository.list_transactions(bank=resolve_bank(bank))
+
+
+def bank_coverage(bank: str | None) -> dict:
+    return dataset_repository.coverage(bank=resolve_bank(bank))
+
+
 @app.get("/api/assistant/status")
 def assistant_status():
     return GroqAIService.status()
@@ -160,18 +193,24 @@ def assistant_ask(payload: AIAskPayload):
         if payload.conversationId:
             chat = ai_chat_repository.get_summary(payload.conversationId)
             conversation_summary, history = ai_chat_repository.get_ai_memory(chat["id"])
+            # Do not let prior ALL/FNB/Capitec financial details leak into a
+            # different bank's reasoning. Single-bank queries are standalone.
+            if resolve_bank(payload.bank) is not None:
+                conversation_summary, history = {}, []
         else:
             chat = None
             conversation_summary, history = {}, []
 
-        transactions = dataset_repository.list_transactions()
+        selected_bank = resolve_bank(payload.bank)
+        transactions = bank_transactions(payload.bank)
         section(trace_id, "LOCAL INPUTS AVAILABLE BEFORE ROUTING", {
+            "bankScope": selected_bank or "all",
             "conversationId": payload.conversationId,
             "chatFound": chat is not None,
             "compactSavedChatMemory": conversation_summary,
             "recentSavedMessagesAvailableLocally": len(history),
             "transactionsAvailableLocally": len(transactions),
-            "coverage": dataset_repository.coverage(),
+            "coverage": bank_coverage(payload.bank),
             "trackingSettings": settings_repository.get_all(),
             "note": "None of the financial data is sent externally until the validated query plan explicitly chooses the AI-answer path.",
         })
@@ -179,7 +218,7 @@ def assistant_ask(payload: AIAskPayload):
             question=payload.question,
             transactions=transactions,
             settings=settings_repository.get_all(),
-            coverage=dataset_repository.coverage(),
+            coverage=bank_coverage(payload.bank),
             history=history,
             conversation_summary=conversation_summary,
             trace_id=trace_id,
@@ -187,6 +226,7 @@ def assistant_ask(payload: AIAskPayload):
         answer = result.answer
         data_used = result.data_used
         data_used["traceId"] = trace_id
+        data_used["bankScope"] = selected_bank or "all"
         model = result.model
 
         if chat is None:
@@ -238,18 +278,23 @@ def assistant_ask(payload: AIAskPayload):
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "supportedBanks": ["FNB"]}
+    return {"status": "ok", "supportedBanks": list(ExtractorRegistry.SUPPORTED_BANKS)}
 
 
 @app.get("/api/dataset")
-def dataset():
-    statements = dataset_repository.list_statements()
+def dataset(bank: str | None = None):
+    selected = resolve_bank(bank)
+    statements = dataset_repository.list_statements()  # Upload management always shows every bank.
+    selected_set = set(selected.split(',')) if selected else set()
+    matching_statements = [item for item in statements if not selected or item['bank'] in selected_set]
     return {
-        "statement": statements[0] if statements else None,
+        "statement": matching_statements[0] if matching_statements else None,
         "statements": statements,
-        "coverage": dataset_repository.coverage(),
+        "availableBanks": imported_banks(),
+        "selectedBank": selected or "all",
+        "coverage": bank_coverage(bank),
         "settings": settings_repository.get_all(),
-        "transactions": dataset_repository.list_transactions(),
+        "transactions": bank_transactions(bank),
     }
 
 
@@ -273,8 +318,8 @@ def delete_statement(statement_id: str):
 
 
 @app.get("/api/coverage")
-def coverage():
-    return dataset_repository.coverage()
+def coverage(bank: str | None = None):
+    return bank_coverage(bank)
 
 
 @app.get("/api/tracking-settings")
@@ -299,15 +344,13 @@ def update_tracking_settings(payload: TrackingSettingsPayload):
 
 
 @app.get("/api/transactions")
-def transactions():
-    return dataset_repository.list_transactions()
+def transactions(bank: str | None = None):
+    return bank_transactions(bank)
 
 
 @app.get("/api/review-groups")
-def review_groups():
-    return ReviewGroupingService.review_buckets(
-        dataset_repository.list_transactions()
-    )
+def review_groups(bank: str | None = None):
+    return ReviewGroupingService.review_buckets(bank_transactions(bank))
 
 
 @app.post("/api/review/confirm")
@@ -360,23 +403,23 @@ def update_budget_profile(payload: BudgetProfilePayload):
 
 
 @app.get("/api/reports")
-def reports():
+def reports(bank: str | None = None):
     return ReportingService.build(
-        dataset_repository.list_transactions(),
+        bank_transactions(bank),
         settings_repository.get_all(),
-        dataset_repository.coverage(),
+        bank_coverage(bank),
     )
 
 
 @app.post("/api/reports/explore")
-def explore_report(payload: ReportExplorerPayload):
+def explore_report(payload: ReportExplorerPayload, bank: str | None = None):
     try:
         start = date.fromisoformat(payload.startDate) if payload.startDate else None
         end = date.fromisoformat(payload.endDate) if payload.endDate else None
         if start and end and end < start:
             raise ValueError("End date must be on or after the start date.")
         return ReportingService.build_explorer(
-            dataset_repository.list_transactions(),
+            bank_transactions(bank),
             start=start,
             end=end,
             category=payload.category,
@@ -388,10 +431,10 @@ def explore_report(payload: ReportExplorerPayload):
 
 
 @app.get("/api/reports/custom")
-def custom_report(start: date, end: date):
+def custom_report(start: date, end: date, bank: str | None = None):
     try:
         return ReportingService.build_custom_period(
-            dataset_repository.list_transactions(), start, end
+            bank_transactions(bank), start, end
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -408,6 +451,8 @@ def update_transactions_batch(payload: BatchTransactionUpdate):
             status_code=404,
             detail="One or more transactions were not found.",
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.patch("/api/transactions/{transaction_id}")
@@ -419,6 +464,8 @@ def update_transaction(transaction_id: str, payload: TransactionUpdate):
         )
     except KeyError:
         raise HTTPException(status_code=404, detail="Transaction not found.")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.patch("/api/transactions/{transaction_id}/salary")
@@ -432,9 +479,9 @@ def set_salary_marker(transaction_id: str, payload: SalaryMarkerPayload):
 
 
 @app.get("/api/income-overview")
-def income_overview():
+def income_overview(bank: str | None = None):
     return SalaryDetectionService.build_income_overview(
-        dataset_repository.list_transactions(),
+        bank_transactions(bank),
         salary_source_repository.list_active(),
     )
 
@@ -533,7 +580,47 @@ def remove_salary_source(source_id: int):
 
 @app.get("/api/categories")
 def categories():
-    return [item["name"] for item in category_repository.list_active()]
+    return [item['name'] for item in category_repository.overview()]
+
+
+@app.get('/api/categories/overview')
+def categories_overview(bank: str | None = None):
+    return category_repository.overview(bank=resolve_bank(bank))
+
+
+@app.patch('/api/categories/{category_name}')
+def rename_category(category_name: str, payload: CategoryPayload):
+    try:
+        return category_repository.rename(category_name, payload.name)
+    except KeyError:
+        raise HTTPException(status_code=404, detail='Category not found.')
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+class CategoryMergePayload(BaseModel):
+    source: str
+    target: str
+
+
+@app.post('/api/categories/merge')
+def merge_categories(payload: CategoryMergePayload):
+    try:
+        return category_repository.merge(payload.source, payload.target)
+    except KeyError:
+        raise HTTPException(status_code=404, detail='Category not found.')
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete('/api/categories/{category_name}')
+def delete_category(category_name: str):
+    try:
+        return category_repository.delete(category_name)
+    except KeyError:
+        raise HTTPException(status_code=404, detail='Category not found.')
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @app.post("/api/categories", status_code=201)

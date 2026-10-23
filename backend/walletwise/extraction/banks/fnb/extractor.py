@@ -3,7 +3,6 @@ import pymupdf
 from walletwise.config import AppConfig
 from walletwise.extraction.base import BankStatementExtractor
 from walletwise.models import ExtractionResult
-from walletwise.utils.date_utils import detect_statement_year
 
 from .config import FNBConfig
 from .debug_pdf import FNBDebugPDFGenerator
@@ -13,6 +12,7 @@ from .pdf_extractor import FNBPDFExtractor
 from .row_parser import FNBRowParser
 from .table_detector import FNBTableDetector
 from .transaction_builder import FNBTransactionBuilder
+from .statement_period import detect_statement_period, write_period_debug_pdf, write_period_debug_json
 
 
 class FNBStatementExtractor(BankStatementExtractor):
@@ -46,15 +46,24 @@ class FNBStatementExtractor(BankStatementExtractor):
             self.ocr_service,
         )
 
-    def _statement_year(self, pdf_file: str) -> int:
-        if self.config.statement_start_year is not None:
-            return self.config.statement_start_year
-        with pymupdf.open(pdf_file) as pdf:
-            return detect_statement_year(pdf)
-
     def extract(self, pdf_file: str) -> ExtractionResult:
-        start_year = self._statement_year(pdf_file)
-        print(f"Using statement year: {start_year}")
+        with pymupdf.open(pdf_file) as pdf:
+            period = detect_statement_period(
+                pdf, ocr_enabled=self.config.enable_ocr, tesseract_cmd=self.config.tesseract_cmd,
+            )
+        if period is None and self.config.statement_start_year is None:
+            raise ValueError(
+                "FNB Statement Period could not be verified in the PDF header. "
+                "Import stopped to avoid assigning transactions to the wrong year. "
+                "Check that the PDF includes 'Statement Period: <start> to <end>' "
+                "and that OCR is available if it is a scanned statement."
+            )
+        start_year = period.start.year if period else self.config.statement_start_year
+        if period:
+            print(f"[PERIOD] Verified {period.start:%Y-%m-%d} -> {period.end:%Y-%m-%d} "
+                  f"(page {period.page}, {period.source})")
+        else:
+            print(f"[PERIOD] Manual year override: {start_year} (UNVERIFIED)")
 
         rows, page_counts = self.pdf_extractor.extract_rows(pdf_file)
         print(f"Visual rows detected: {len(rows)}")
@@ -74,7 +83,14 @@ class FNBStatementExtractor(BankStatementExtractor):
             if self.debugger.create_ocr_debug_pdf(pdf_file, rows, ocr_debug):
                 debug_files.append(ocr_debug)
 
-        drafts, orphan_rows = self.builder.build(rows, start_year)
+        drafts, orphan_rows = self.builder.build(rows, start_year, statement_period=period)
+        print(f"[PERIOD] Accepted {len(drafts)} rows; rejected {len(orphan_rows)} unassigned rows")
+        if period and self.app_config.generate_debug_pdfs:
+            period_pdf = f"{self.app_config.debug_prefix}_FNB_Period_Debug.pdf"
+            period_json = f"{self.app_config.debug_prefix}_FNB_Period_Debug.json"
+            write_period_debug_pdf(pdf_file, period, period_pdf)
+            write_period_debug_json(period, drafts, orphan_rows, period_json)
+            debug_files.extend([period_pdf, period_json])
         transactions = self.normalizer.transactions(drafts)
         unassigned = self.normalizer.orphan_rows(orphan_rows)
 
@@ -84,4 +100,5 @@ class FNBStatementExtractor(BankStatementExtractor):
             page_counts=page_counts,
             unassigned_rows=unassigned,
             debug_files=debug_files,
+            statement_period=period.as_dict() if period else None,
         )

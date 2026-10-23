@@ -35,6 +35,14 @@ class DatabaseAwareTransactionNamer:
     def enrich(self, transactions):
         active_rules = self.rules.list_active()
         for transaction in transactions:
+            if transaction.bank == "Capitec" and transaction.category == "Bank Fees":
+                # Actual fees are separate posted movements, never rename into
+                # a merchant purchase just because their description has one.
+                transaction.display_name = "Capitec Bank Fee" if transaction.amount < 0 else "Capitec Fee Refund"
+                transaction.naming_confidence = "high"
+                transaction.name_source = "capitec_posted_fee"
+                transaction.naming_reason = "Fee value came from Capitec's Fee column."
+                continue
             # Let a user rule match either the untouched bank description OR the
             # current friendly name. This is useful when WalletWise has already
             # cleaned something like "FNB App Payment To Transport Leshens
@@ -53,6 +61,8 @@ class DatabaseAwareTransactionNamer:
                 ),
                 None,
             )
+            if matched and transaction.category == "Bank Fees" and transaction.bank == "Capitec":
+                matched = None  # Preserve actual posted bank fee accounting.
             if matched:
                 transaction.display_name = matched["displayName"]
                 transaction.naming_confidence = "high"
@@ -86,6 +96,8 @@ class DatabaseAwareCategoryService:
     def classify(self, transactions):
         active_rules = self.rules.list_active()
         for transaction in transactions:
+            if transaction.bank == "Capitec" and transaction.category == "Bank Fees":
+                continue  # Explicit posted bank fees must never be reclassified by a user rule.
             searchable = " ".join(
                 part
                 for part in (transaction.raw_description, transaction.display_name)
@@ -157,9 +169,12 @@ class StatementProcessingService:
                 pdf_file=str(temp_path),
                 output_file=str(self.data_directory / "WalletWise_Statement.xlsx"),
                 tesseract_cmd=tesseract_cmd,
-                generate_debug_pdfs=False,
+                generate_debug_pdfs=os.getenv("WALLETWISE_IMPORT_DEBUG", "0").lower() in {"1", "true", "yes"},
+                debug_prefix=str(self.data_directory / "debug" / f"import-{uuid.uuid4().hex[:8]}"),
             )
 
+            if config.generate_debug_pdfs:
+                (self.data_directory / "debug").mkdir(parents=True, exist_ok=True)
             extractor = ExtractorRegistry.create(bank, config)
             result = extractor.extract(str(temp_path))
 
@@ -181,6 +196,7 @@ class StatementProcessingService:
                 bank=result.bank,
                 file_hash=hashlib.sha256(contents).hexdigest(),
                 transactions=transaction_pairs,
+                statement_period=result.statement_period,
             )
 
             # A salary source only becomes trusted after the user confirms it.
@@ -206,6 +222,8 @@ class StatementProcessingService:
                 "statements": self.dataset_repository.list_statements(),
                 "coverage": self.dataset_repository.coverage(),
                 "unassignedCount": len(result.unassigned_rows),
+                "periodDetection": result.statement_period or {"verified": False},
+                "periodDebugFiles": result.debug_files if config.generate_debug_pdfs else [],
             }
         finally:
             if temp_path is not None:

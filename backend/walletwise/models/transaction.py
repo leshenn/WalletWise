@@ -28,6 +28,7 @@ class Transaction:
     balance: float | None = None
     bank_charges: float | None = None
     bank: str = ""
+    savings_direction: str = ""  # into / out / none; explicit Capitec classification
 
     # Extraction confidence is separate from interpretation confidence.
     confidence: str = "high"

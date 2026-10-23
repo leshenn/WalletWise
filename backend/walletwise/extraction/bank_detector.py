@@ -9,8 +9,7 @@ class BankDetector:
     """
     Detect the statement's bank before extraction.
 
-    Only FNB signatures are enabled right now because FNB is the only implemented
-    adapter. New signatures can be added without changing the rest of WalletWise.
+    FNB and Capitec signatures are recognised; never guess unknown banks.
     """
 
     @staticmethod
@@ -23,6 +22,10 @@ class BankDetector:
 
     def detect(self, pdf_file: str) -> str:
         text = self._first_pages_text(pdf_file)
+
+        if ("capitec bank limited" in text or "capitec bank is an authorised" in text or
+                ("capitec" in text and "main account statement" in text)):
+            return "Capitec"
 
         # Strong FNB identifiers. We intentionally do not guess another bank.
         fnb_signatures = (
@@ -40,6 +43,5 @@ class BankDetector:
 
         raise UnsupportedBankError(
             "WalletWise could not identify a supported bank statement. "
-            "The standard output format is multi-bank, but the only extractor "
-            "implemented right now is FNB."
+            "Supported banks: FNB and Capitec."
         )

@@ -197,7 +197,7 @@ function StructuredAnswer({ answer, onUseFollowUp }) {
   );
 }
 
-export default function AskPage() {
+export default function AskPage({ bankScope = 'all' }) {
   const [status, setStatus] = useState(null);
   const [chats, setChats] = useState([]);
   const [activeChatId, setActiveChatId] = useState(null);
@@ -361,6 +361,11 @@ export default function AskPage() {
         <p>Wally</p>
         <h1>Your WalletWise money companion</h1>
         <span>Ask about affordability, spending, savings or goals. Wally only receives the financial context needed for your question.</span>
+      </div>
+
+      <div className="wally-bank-scope-note">
+        Wally is using <strong>{bankScope === 'all' ? 'all imported banks' : `${bankScope.split(',').join(' and ')} transactions only`}</strong> for new questions.
+        Saved chats may contain answers from earlier bank selections.
       </div>
 
       {status && !status.configured && (

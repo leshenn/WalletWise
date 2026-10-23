@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
+import re
 
 from .budgeting import BudgetService
 
@@ -93,6 +94,28 @@ class ReportingService:
             monthly.append(report)
             previous = report
 
+        annual_items: dict[int, list[dict]] = defaultdict(list)
+        for item in usable:
+            day = cls._parse_date(item.get("date"))
+            if day:
+                annual_items[day.year].append(item)
+        available_years = sorted(set(annual_items) | {int(key[:4]) for key in month_keys})
+        yearly = []
+        for year in available_years:
+            start_of_year = date(year, 1, 1)
+            end_of_year = date(year, 12, 31)
+            report = cls._period_report(
+                period_id=str(year), label=str(year), start=start_of_year,
+                end=end_of_year, items=annual_items.get(year, []),
+            )
+            covered_days = sum(int(item.get("coveredDays", 0)) for item in coverage.get("months", [])
+                               if str(item.get("month", "")).startswith(f"{year}-"))
+            report["year"] = year
+            report["coveredDays"] = covered_days
+            report["coveragePct"] = round(covered_days * 100 / report["days"], 1)
+            report["complete"] = covered_days == report["days"]
+            yearly.append(report)
+
         monthly_spending = [item["spending"] for item in monthly]
         monthly_income = [item["income"] for item in monthly]
 
@@ -116,7 +139,7 @@ class ReportingService:
 
         top3_total = sum(item["amount"] for item in category_breakdown[:3])
 
-        savings = cls._savings_metrics(transfer_items, income)
+        savings = cls._savings_metrics(transfer_items, income, usable)
         recurring_merchants = cls._recurring_merchants(expenses)
         confidence = cls._confidence_overview(usable)
 
@@ -140,6 +163,8 @@ class ReportingService:
             },
             "savings": savings,
             "monthly": monthly,
+            "yearly": yearly,
+            "availableYears": available_years,
             "availableMonths": [
                 {
                     "month": item["month"],
@@ -396,7 +421,7 @@ class ReportingService:
             "uncategorisedSpendingPct": cls._pct(uncategorised, spending),
             "flexibleSpending": flexible,
             "flexibleSpendingPct": cls._pct(flexible, spending),
-            **cls._savings_metrics(transfers, income),
+            **cls._savings_metrics(transfers, income, items),
         }
 
     @classmethod
@@ -464,7 +489,7 @@ class ReportingService:
             "uncategorisedSpendingPct": cls._pct(uncategorised, spending),
             "flexibleSpending": flexible,
             "flexibleSpendingPct": cls._pct(flexible, spending),
-            **cls._savings_metrics(transfers, income),
+            **cls._savings_metrics(transfers, income, items),
         }
 
     @classmethod
@@ -655,28 +680,114 @@ class ReportingService:
         return result[:8]
 
     @classmethod
-    def _savings_metrics(cls, transfers: list[dict], income: float) -> dict:
-        savings_transfers = [item for item in transfers if cls._looks_like_savings(item)]
-        outflow = round(sum(
-            abs(cls._number(item.get("amount")))
-            for item in savings_transfers
-            if cls._number(item.get("amount")) < 0
-        ), 2)
-        inflow = round(sum(
-            cls._number(item.get("amount"))
-            for item in savings_transfers
-            if cls._number(item.get("amount")) > 0
-        ), 2)
-        net = round(outflow - inflow, 2)
+    def _savings_metrics(
+        cls, transfers: list[dict], income: float, period_items: list[dict] | None = None
+    ) -> dict:
+        """Audit savings *movements*, not an account balance or total wealth.
+
+        Explicit user directions override both the bank sign and fuzzy wording.
+        Legacy transfers are retained provisionally and clearly labelled as
+        inferred until reviewed; category/role mismatches stay visible.
+        """
+        savings_entries = []
+        for item in transfers:
+            amount = cls._number(item.get('amount'))
+            direction = str(item.get('savingsDirection') or '').strip().casefold()
+            if direction == 'none':
+                continue
+            confirmed = direction in {'into', 'out'}
+            if confirmed:
+                # The user has decided which way the money moved.
+                effect = abs(amount) if direction == 'into' else -abs(amount)
+            elif cls._looks_like_savings(item):
+                # For legacy FNB labels, direction words take precedence over
+                # the bank-sign assumption where they are unambiguous.
+                evidence = str(item.get('rawDescription') or item.get('displayName') or '').casefold()
+                if re.search(r'\b(?:from|out\s+of)\s+(?:my\s+)?savings?\b', evidence) or re.search(r'\bsavings?\s+withdrawal\b', evidence):
+                    effect = -abs(amount)
+                elif re.search(r'\b(?:to|into)\s+(?:my\s+)?savings?\b', evidence):
+                    effect = abs(amount)
+                else:
+                    effect = -amount
+                direction = 'into' if effect > 0 else 'out' if effect < 0 else ''
+                confirmed = bool(
+                    item.get('humanVerified') and
+                    str(item.get('category') or '').strip().casefold() == 'savings'
+                )
+            else:
+                continue
+            if not effect:
+                continue
+            savings_entries.append({
+                'id': item.get('id'),
+                'date': item.get('date'),
+                'name': item.get('displayName') or item.get('rawDescription') or 'Transfer',
+                'category': item.get('category') or 'Uncategorised',
+                'amount': round(amount, 2),
+                'savingsEffect': round(effect, 2),
+                'direction': direction,
+                'confirmed': confirmed,
+            })
+
+        added = round(sum(entry['savingsEffect'] for entry in savings_entries if entry['savingsEffect'] > 0), 2)
+        withdrawn = round(-sum(entry['savingsEffect'] for entry in savings_entries if entry['savingsEffect'] < 0), 2)
+        net = round(added - withdrawn, 2)
+        confirmed_net = round(sum(entry['savingsEffect'] for entry in savings_entries if entry['confirmed']), 2)
+        inferred_net = round(net - confirmed_net, 2)
+        inferred_count = sum(not entry['confirmed'] for entry in savings_entries)
+        uncounted = [
+            item for item in (period_items or transfers)
+            if str(item.get('category') or '').strip().casefold() == 'savings'
+            and item.get('financialRole') != 'transfer'
+            and item.get('financialRole') not in {'balance'}
+            and item.get('transactionType') != 'closing_balance'
+        ]
+        correctable_ids = [
+            item['id'] for item in uncounted
+            if item.get('id') and item.get('financialRole') in {'expense', 'unknown'}
+            and cls._number(item.get('amount')) < 0 and not item.get('isSalary')
+        ]
         return {
-            "savingsTransfersOut": outflow,
-            "savingsTransfersIn": inflow,
-            "netSavingsMovement": net,
-            "savingsTransferRatePct": cls._pct(outflow, income) if income > 0 else None,
+            'savingsTransfersOut': added,
+            'savingsTransfersIn': withdrawn,
+            'netSavingsMovement': net,
+            # A net savings rate must use NET savings, not gross deposits.
+            'savingsTransferRatePct': cls._pct(net, income) if income > 0 else None,
+            'savingsGrossTransferRatePct': cls._pct(added, income) if income > 0 else None,
+            'confirmedSavingsMovement': confirmed_net,
+            'inferredSavingsMovement': inferred_net,
+            'savingsUnconfirmedCount': inferred_count,
+            'savingsTransactionCount': len(savings_entries),
+            'savingsEntries': savings_entries,
+            'savingsUncountedCount': len(uncounted),
+            'savingsCorrectableIds': correctable_ids,
         }
 
     @staticmethod
     def _looks_like_savings(item: dict) -> bool:
+        category = str(item.get("category") or "").strip().casefold()
+        # Suspicious savings-account fees and interest are not savings movements.
+        # A manual savings-direction marker, processed before this method, can
+        # still override the automatic suggestion.
+        raw = str(item.get('rawDescription') or item.get('displayName') or '').casefold()
+        if re.search(r'\bsavings?\b', raw) and re.search(
+            r'\b(?:fees?|charges?|interest|premium)\b', raw
+        ) and not item.get('humanVerified'):
+            return False
+        if category == "savings":
+            return True
+        # A human-corrected category is authoritative. Otherwise a transaction
+        # originally described as "to savings" can remain in savings even after
+        # the user corrects it to e.g. "Groceries".
+        category_reason = str(item.get("categoryReason") or "").strip().casefold()
+        # A reviewed non-Savings category is authoritative, even for older
+        # edits that didn't store an explicit savings-direction marker.
+        if item.get("humanVerified"):
+            return False
+        if category_reason in {"edited by user", "corrected by user"}:
+            return False
+        # For *unreviewed* transfers, retain the original FNB description
+        # heuristic so previously imported savings transfers still count.
         text = " ".join(
             str(part or "")
             for part in (
@@ -685,7 +796,7 @@ class ReportingService:
                 item.get("rawDescription"),
             )
         ).casefold()
-        return "saving" in text or "savings" in text
+        return re.search(r'\bsavings?\b', text) is not None
 
     @classmethod
     def _confidence_overview(cls, items: list[dict]) -> dict:

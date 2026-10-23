@@ -619,8 +619,17 @@ class WallyAnswerEngine:
                     if fee > 0:
                         additional += fee
                         fees_count += 1
-        total = round(base + additional, 2)
-        found = bool(matching or fees_count)
+        fee_refunds = 0.0
+        refund_count = 0
+        if category.casefold() == "bank fees":
+            for row in items:
+                if (str(row.get("category") or "").casefold() == "bank fees"
+                    and row.get("financialRole") == "refund"
+                    and cls._num(row.get("amount")) > 0):
+                    fee_refunds += cls._num(row.get("amount"))
+                    refund_count += 1
+        total = round(base + additional - fee_refunds, 2)
+        found = bool(matching or fees_count or refund_count)
         warning = ("The result depends on how correctly statement fees and transactions were classified."
                    if category.casefold() == "bank fees" else
                    "The result depends on transaction categorisation.")
@@ -643,7 +652,8 @@ class WallyAnswerEngine:
         debug = {"executor": "category_sum", "category": category, "scope": plan.scope,
                  "scopeLabel": label, "categoryDebitTotal": base,
                  "additionalBankCharges": round(additional, 2), "matchedExpenses": len(matching),
-                 "matchedSeparateFeeFields": fees_count, "result": total if found else None}
+                 "matchedSeparateFeeFields": fees_count,
+                 "bankFeeRefunds": round(fee_refunds, 2), "result": total if found else None}
         return answer, meta, debug
 
     @classmethod
@@ -687,6 +697,9 @@ class WallyAnswerEngine:
                 if expense and (not category or str(row.get("category") or "").casefold() == category.casefold()):
                     total += abs(cls._num(row.get("amount")))
                     matched += 1
+                if category == "Bank Fees" and fee_category and row.get("financialRole") == "refund" and cls._num(row.get("amount")) > 0:
+                    total -= cls._num(row.get("amount"))
+                    charge_count += 1  # Count net fee corrections in evidence.
                 if category == "Bank Fees" and (not fee_category or not expense) and row.get("transactionType") != "closing_balance":
                     # Per-transaction bank charges can exist even when the
                     # underlying purchase is not itself a 'Bank Fees' expense.

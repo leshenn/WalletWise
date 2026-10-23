@@ -186,6 +186,7 @@ class CategoryRepository:
                 (name,),
             ).fetchone()
             if existing is not None:
+                connection.execute('UPDATE categories SET active = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?', (existing['id'],))
                 return {"id": existing["id"], "name": existing["name"]}
 
             cursor = connection.execute(
@@ -197,6 +198,117 @@ class CategoryRepository:
                 (cursor.lastrowid,),
             ).fetchone()
         return {"id": row["id"], "name": row["name"]}
+
+
+    PROTECTED = {'uncategorised', 'bank fees', 'savings', 'transfer', 'salary'}
+
+    @staticmethod
+    def _clean(name: str) -> str:
+        name = " ".join((name or "").split()).strip()
+        if not name or len(name) > 60:
+            raise ValueError('Category name must be between 1 and 60 characters.')
+        return name
+
+    @staticmethod
+    def _existing(connection, name: str):
+        row = connection.execute('SELECT id, name, active FROM categories WHERE name = ? COLLATE NOCASE', (name,)).fetchone()
+        # Imported bank categories can exist on transactions without a category registry entry.
+        return row
+
+    def overview(self, bank: str | tuple[str, ...] | None = None) -> list[dict]:
+        banks = DatasetRepository._selected_banks(bank)
+        with self.database.connect() as connection:
+            active = {r['name'].casefold(): r['name'] for r in connection.execute('SELECT name FROM categories WHERE active = 1')}
+            all_rows = connection.execute("SELECT category, COUNT(*) AS n FROM transactions WHERE transaction_type != 'closing_balance' AND financial_role != 'balance' GROUP BY category").fetchall()
+            counts = {r['category'].casefold(): int(r['n']) for r in all_rows}
+            names = dict(active)
+            for r in all_rows:
+                names.setdefault(r['category'].casefold(), r['category'])
+            if banks:
+                selected_rows = connection.execute(
+                    f"SELECT category, COUNT(*) AS n FROM transactions WHERE bank IN ({','.join('?' for _ in banks)}) AND transaction_type != 'closing_balance' AND financial_role != 'balance' GROUP BY category",
+                    banks,
+                ).fetchall()
+                scoped = {r['category'].casefold(): int(r['n']) for r in selected_rows}
+            else:
+                scoped = counts
+            return [
+                {'name': name, 'transactionCount': scoped.get(key, 0),
+                 'totalTransactionCount': counts.get(key, 0),
+                 'protected': key in self.PROTECTED}
+                for key, name in sorted(names.items(), key=lambda pair: (pair[0] == 'uncategorised', pair[0]))
+            ]
+
+    def rename(self, source: str, target: str) -> dict:
+        source, target = self._clean(source), self._clean(target)
+        if source.casefold() in self.PROTECTED:
+            raise ValueError('This core financial category cannot be renamed.')
+        with self.database.connect() as connection:
+            source_row = self._existing(connection, source)
+            actual = connection.execute('SELECT category FROM transactions WHERE category = ? COLLATE NOCASE LIMIT 1', (source,)).fetchone()
+            if source_row is None and actual is None:
+                raise KeyError(source)
+            dest = self._existing(connection, target)
+            used = connection.execute('SELECT 1 FROM transactions WHERE category = ? COLLATE NOCASE LIMIT 1', (target,)).fetchone()
+            if source.casefold() != target.casefold() and (dest or used):
+                raise ValueError('Target category already exists; use Merge instead.')
+            if source.casefold() == target.casefold():
+                if source_row:
+                    connection.execute('UPDATE categories SET name = ?, active = 1, updated_at=CURRENT_TIMESTAMP WHERE id = ?', (target, source_row['id']))
+            else:
+                # Keep an inactive tombstone for the old name. Otherwise the
+                # default-category seeder resurrects a renamed built-in category.
+                if source_row:
+                    connection.execute('UPDATE categories SET active=0, updated_at=CURRENT_TIMESTAMP WHERE id=?', (source_row['id'],))
+                else:
+                    connection.execute('INSERT INTO categories (name, active) VALUES (?, 0)', (source,))
+                connection.execute('INSERT INTO categories (name, active) VALUES (?, 1)', (target,))
+            counts = self._reassign(connection, source, target)
+        return {'source': source, 'target': target, **counts}
+
+    @staticmethod
+    def _reassign(connection, source: str, target: str) -> dict:
+        transaction_count = connection.execute('UPDATE transactions SET category = ? WHERE category = ? COLLATE NOCASE', (target, source)).rowcount
+        naming_count = connection.execute('UPDATE naming_rules SET category = ? WHERE category = ? COLLATE NOCASE', (target, source)).rowcount
+        rule_count = connection.execute('UPDATE category_rules SET category = ? WHERE category = ? COLLATE NOCASE', (target, source)).rowcount
+        return {'transactionsUpdated': transaction_count, 'namingRulesUpdated': naming_count, 'categoryRulesUpdated': rule_count}
+
+    def merge(self, source: str, target: str) -> dict:
+        source, target = self._clean(source), self._clean(target)
+        if source.casefold() == target.casefold():
+            raise ValueError('Choose two different categories.')
+        if source.casefold() in self.PROTECTED:
+            raise ValueError('This core financial category cannot be merged away.')
+        if target.casefold() in self.PROTECTED and target.casefold() != 'uncategorised':
+            raise ValueError('Cannot merge into a core financial category because that may change financial reporting semantics.')
+        with self.database.connect() as connection:
+            actual = connection.execute('SELECT 1 FROM transactions WHERE category = ? COLLATE NOCASE LIMIT 1', (source,)).fetchone()
+            registered = self._existing(connection, source)
+            if not actual and not registered:
+                raise KeyError(source)
+            target_row = self._existing(connection, target)
+            actual_target = connection.execute('SELECT 1 FROM transactions WHERE category = ? COLLATE NOCASE LIMIT 1', (target,)).fetchone()
+            if not target_row and not actual_target:
+                raise KeyError(target)
+            if target_row and not target_row['active']:
+                connection.execute('UPDATE categories SET active=1 WHERE id=?', (target_row['id'],))
+            result = self._reassign(connection, source, target)
+            connection.execute('UPDATE categories SET active=0, updated_at=CURRENT_TIMESTAMP WHERE name = ? COLLATE NOCASE', (source,))
+        return {'source': source, 'target': target, **result}
+
+    def delete(self, source: str) -> dict:
+        source = self._clean(source)
+        if source.casefold() in self.PROTECTED:
+            raise ValueError('This core financial category cannot be deleted.')
+        with self.database.connect() as connection:
+            registered = self._existing(connection, source)
+            used = connection.execute('SELECT 1 FROM transactions WHERE category = ? COLLATE NOCASE LIMIT 1', (source,)).fetchone()
+            if registered is None and not used:
+                raise KeyError(source)
+            result = self._reassign(connection, source, 'Uncategorised')
+            # Deleted rules must not silently assign this category again on the next import.
+            connection.execute('UPDATE categories SET active=0, updated_at=CURRENT_TIMESTAMP WHERE name = ? COLLATE NOCASE', (source,))
+        return {'source': source, 'replacement': 'Uncategorised', **result}
 
 
 class CategoryRuleRepository(RuleMatcher):
@@ -479,6 +591,7 @@ class DatasetRepository:
         bank: str,
         file_hash: str,
         transactions: Iterable[tuple[str, Transaction]],
+        statement_period: dict | None = None,
     ) -> dict:
         """Append a statement and link duplicate rows to one canonical transaction.
 
@@ -495,11 +608,20 @@ class DatasetRepository:
             and transaction.transaction_type != "closing_balance"
             and transaction.financial_role != "balance"
         ]
-        period_start = min(dates) if dates else None
-        period_end = max(dates) if dates else None
+        if statement_period and statement_period.get("verified"):
+            period_start = statement_period["start"]
+            period_end = statement_period["end"]
+            period_source = statement_period.get("source") or "PDF header"
+            period_header = statement_period.get("matched_header") or ""
+        else:
+            period_start = min(dates) if dates else None
+            period_end = max(dates) if dates else None
+            period_source = "transaction_dates"  # legacy non-header imports only
+            period_header = ""
 
         imported_count = 0
         duplicate_count = 0
+        fingerprint_occurrences: dict[str, int] = {}
 
         with self.database.connect() as connection:
             if file_hash:
@@ -516,8 +638,9 @@ class DatasetRepository:
                 """
                 INSERT INTO statements (
                     id, filename, bank, processed_at, transaction_count,
-                    imported_count, duplicate_count, period_start, period_end, file_hash
-                ) VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?)
+                    imported_count, duplicate_count, period_start, period_end,
+                    period_source, period_header, file_hash
+                ) VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)
                 """,
                 (
                     statement_id,
@@ -527,12 +650,23 @@ class DatasetRepository:
                     len(transactions),
                     period_start,
                     period_end,
+                    period_source,
+                    period_header,
                     file_hash,
                 ),
             )
 
             for position, (proposed_id, transaction) in enumerate(transactions):
-                fingerprint = self.transaction_fingerprint(bank=bank, transaction=transaction)
+                base_fingerprint = self.transaction_fingerprint(bank=bank, transaction=transaction)
+                seen = fingerprint_occurrences.get(base_fingerprint, 0)
+                fingerprint_occurrences[base_fingerprint] = seen + 1
+                # Two genuine posted transactions can have the same date, amount,
+                # description and running balance (e.g. two Capitec payment fees).
+                # Keep an occurrence-indexed fingerprint within each statement;
+                # ordinary first occurrences retain legacy fingerprints.
+                fingerprint = (base_fingerprint if seen == 0 else hashlib.sha256(
+                    f"{base_fingerprint}|occurrence:{seen + 1}".encode("utf-8")
+                ).hexdigest())
                 existing = connection.execute(
                     "SELECT id FROM transactions WHERE fingerprint = ? LIMIT 1",
                     (fingerprint,),
@@ -591,6 +725,11 @@ class DatasetRepository:
                         ),
                     )
 
+                if existing is None and getattr(transaction, "savings_direction", ""):
+                    connection.execute("UPDATE transactions SET savings_direction = ? WHERE id = ?", (
+                        transaction.savings_direction, transaction_id,
+                    ))
+
                 connection.execute(
                     """
                     INSERT OR IGNORE INTO statement_transactions (
@@ -615,18 +754,29 @@ class DatasetRepository:
     def replace_dataset(self, **kwargs) -> None:
         self.append_statement(file_hash="", **kwargs)
 
-    def list_transactions(self) -> list[dict]:
+    def list_transactions(self, bank: str | tuple[str, ...] | None = None) -> list[dict]:
+        banks = self._selected_banks(bank)
+        scope_sql = f"WHERE t.bank IN ({','.join('?' for _ in banks)})" if banks else ""
         with self.database.connect() as connection:
             rows = connection.execute(
-                """
+                f"""
                 SELECT t.*, COUNT(st.statement_id) AS source_statement_count
                 FROM transactions t
                 LEFT JOIN statement_transactions st ON st.transaction_id = t.id
+                {scope_sql}
                 GROUP BY t.id
                 ORDER BY t.date ASC, t.position ASC, t.id ASC
-                """
+                """, banks,
             ).fetchall()
         return [self._transaction_row(row) for row in rows]
+
+    @staticmethod
+    def _selected_banks(bank: str | tuple[str, ...] | None) -> tuple[str, ...]:
+        if not bank or bank == 'all':
+            return ()
+        if isinstance(bank, str):
+            return tuple(v.strip() for v in bank.split(',') if v.strip())
+        return tuple(bank)
 
     def list_statements(self) -> list[dict]:
         with self.database.connect() as connection:
@@ -714,8 +864,9 @@ class DatasetRepository:
 
         return {"statementId": statement_id, "filename": statement["filename"], "deleted": True}
 
-    def coverage(self) -> dict:
-        statements = self.list_statements()
+    def coverage(self, bank: str | tuple[str, ...] | None = None) -> dict:
+        selected = self._selected_banks(bank)
+        statements = [s for s in self.list_statements() if not selected or s["bank"] in selected]
         ranges = []
         for statement in statements:
             start = statement.get("periodStart")
@@ -776,11 +927,45 @@ class DatasetRepository:
             "end": overall_end.isoformat(),
             "months": months,
             "missingMonths": [item for item in months if item["status"] != "covered"],
-            "note": "Coverage is estimated from the first and last dated transactions in each imported statement.",
+            "note": "New FNB and Capitec uploads use verified dates from the PDF header. Legacy imports may use transaction date boundaries. The coverage is for the selected bank or bank combination only.",
         }
 
     def update_transaction(self, transaction_id: str, payload: dict) -> dict:
         payload = dict(payload or {})
+        existing = self.get_transaction(transaction_id)
+        selected_category = str(payload.get('category', existing.get('category')) or '').strip().casefold()
+        selected_role = payload.get('financialRole', existing.get('financialRole'))
+        if payload.get('savingsDirection') not in (None, '', 'auto', 'into', 'out', 'none'):
+            raise ValueError('Invalid savings direction.')
+        if payload.get('savingsDirection') in {'into', 'out'} and selected_role != 'transfer':
+            raise ValueError('Only transfers can be marked as savings movements.')
+        # A category change FROM Savings is an explicit reclassification.
+        # Clear any old savings marker, even if an older client submits a stale
+        # direction or the original bank description still says "to savings".
+        # The user can separately mark this as a savings transfer later.
+        prior_category = str(existing.get('category') or '').strip().casefold()
+        if 'category' in payload and prior_category == 'savings' and selected_category != 'savings':
+            payload['savingsDirection'] = 'none'
+        elif 'category' in payload and selected_category != 'savings' and 'savingsDirection' not in payload:
+            if existing.get('savingsDirection') in {'into', 'out'}:
+                payload['savingsDirection'] = 'none'
+        # A category-only user edit to Savings is a confirmed savings movement.
+        # It defaults from the bank-account perspective but can be overridden
+        # explicitly in the editor for statements from other account types.
+        if selected_category == 'savings' and 'category' in payload and 'savingsDirection' not in payload:
+            if selected_role == 'transfer' or 'financialRole' not in payload:
+                amount = float(existing.get('amount') or 0)
+                payload['savingsDirection'] = 'into' if amount < 0 else 'out' if amount > 0 else 'none'
+        if payload.get('savingsDirection') == 'auto':
+            payload['savingsDirection'] = ''
+        if 'financialRole' in payload and payload['financialRole'] != 'transfer' and 'savingsDirection' not in payload:
+            payload['savingsDirection'] = 'none'
+        # Category-only edits to Savings OR ordinary Transfers should acquire
+        # the transfer financial role. Only Savings has a savings direction.
+        if 'category' in payload and selected_category in {'savings', 'transfer', 'transfers'} and 'financialRole' not in payload:
+            payload['financialRole'] = 'transfer'
+            payload['roleConfidence'] = 'high'
+            payload['roleReason'] = 'Transfer category selected by user.'
         # A transaction that is no longer income cannot remain a salary anchor.
         if "financialRole" in payload and payload.get("financialRole") != "income":
             payload["isSalary"] = False
@@ -792,6 +977,7 @@ class DatasetRepository:
             "categoryConfidence": "category_confidence",
             "categoryReason": "category_reason",
             "financialRole": "financial_role",
+            "savingsDirection": "savings_direction",
             "roleConfidence": "role_confidence",
             "roleReason": "role_reason",
             "namingConfidence": "naming_confidence",
@@ -816,6 +1002,15 @@ class DatasetRepository:
         return self.get_transaction(transaction_id)
 
     def update_transactions(self, transaction_ids: list[str], payload: dict) -> list[dict]:
+        payload = dict(payload or {})
+        if payload.get('savingsDirection') not in (None, '', 'auto', 'into', 'out', 'none'):
+            raise ValueError('Invalid savings direction.')
+        if payload.get('savingsDirection') == 'auto':
+            payload['savingsDirection'] = ''
+        if 'financialRole' in payload and payload['financialRole'] != 'transfer' and 'savingsDirection' not in payload:
+            payload['savingsDirection'] = 'none'
+        if payload.get('savingsDirection') in {'into', 'out'} and payload.get('financialRole') not in {None, 'transfer'}:
+            raise ValueError('Only transfers can be marked as savings movements.')
         unique_ids = list(dict.fromkeys(transaction_ids))
         if not unique_ids:
             return []
@@ -826,6 +1021,7 @@ class DatasetRepository:
             "categoryConfidence": "category_confidence",
             "categoryReason": "category_reason",
             "financialRole": "financial_role",
+            "savingsDirection": "savings_direction",
             "roleConfidence": "role_confidence",
             "roleReason": "role_reason",
             "namingConfidence": "naming_confidence",
@@ -841,10 +1037,17 @@ class DatasetRepository:
         placeholders = ",".join("?" for _ in unique_ids)
         with self.database.connect() as connection:
             existing = connection.execute(
-                f"SELECT id FROM transactions WHERE id IN ({placeholders})",
+                f"SELECT id, financial_role, category FROM transactions WHERE id IN ({placeholders})",
                 unique_ids,
             ).fetchall()
+            leaving_savings = [row['id'] for row in existing
+                               if row['category'] and str(row['category']).strip().casefold() == 'savings'
+                               and 'category' in payload
+                               and str(payload['category'] or '').strip().casefold() != 'savings']
             existing_ids = {row["id"] for row in existing}
+            if payload.get('savingsDirection') in {'into', 'out'} and payload.get('financialRole') is None:
+                if any(row['financial_role'] != 'transfer' for row in existing):
+                    raise ValueError('Only transfers can be marked as savings movements.')
             missing = [i for i in unique_ids if i not in existing_ids]
             if missing:
                 raise KeyError(missing[0])
@@ -853,6 +1056,26 @@ class DatasetRepository:
                 f"UPDATE transactions SET {', '.join(assignments)} WHERE id IN ({placeholders})",
                 [*values, *unique_ids],
             )
+            # A bulk reclassification out of Savings must never preserve
+            # previous direction markers on the affected transactions.
+            if leaving_savings:
+                leaving_placeholders = ','.join('?' for _ in leaving_savings)
+                connection.execute(
+                    f"UPDATE transactions SET savings_direction = 'none' WHERE id IN ({leaving_placeholders})",
+                    leaving_savings,
+                )
+            # The review action explicitly confirms Savings-labelled movements.
+            # Assign directions individually, using each signed bank movement.
+            if payload.get('financialRole') == 'transfer' and 'savingsDirection' not in payload:
+                connection.execute(
+                    f"""UPDATE transactions
+                       SET savings_direction = CASE WHEN amount < 0 THEN 'into'
+                                                        WHEN amount > 0 THEN 'out'
+                                                        ELSE 'none' END
+                       WHERE id IN ({placeholders}) AND lower(trim(category)) = 'savings'
+                         AND savings_direction = ''""",
+                    unique_ids,
+                )
         return [self.get_transaction(i) for i in unique_ids]
 
     def set_salary_marker(self, transaction_id: str, is_salary: bool) -> dict:
@@ -1184,6 +1407,9 @@ class DatasetRepository:
             "duplicateCount": row["duplicate_count"],
             "periodStart": row["period_start"],
             "periodEnd": row["period_end"],
+            "periodSource": row["period_source"] if "period_source" in row.keys() else "",
+            "periodVerified": bool(row["period_source"] and row["period_source"] not in {"transaction_dates", "legacy"}) if "period_source" in row.keys() else False,
+            "periodHeader": row["period_header"] if "period_header" in row.keys() else "",
             "linkedTransactionCount": row["linked_transaction_count"] if "linked_transaction_count" in row.keys() else row["transaction_count"],
         }
 
@@ -1198,6 +1424,7 @@ class DatasetRepository:
             "categoryConfidence": row["category_confidence"],
             "categoryReason": row["category_reason"],
             "financialRole": row["financial_role"],
+            "savingsDirection": row["savings_direction"] if "savings_direction" in row.keys() else "",
             "roleConfidence": row["role_confidence"],
             "roleReason": row["role_reason"],
             "amount": row["amount"],

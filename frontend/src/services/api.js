@@ -1,8 +1,20 @@
 const explicitBase = (import.meta.env.VITE_API_BASE_URL || '').trim();
 const API_BASE_URL = explicitBase || `http://${window.location.hostname}:8000/api`;
+let selectedBank = 'all';
+
+// Every bank-scoped endpoint uses the same validated backend selection.
+function scopedUrl(path) {
+  const isScoped = /^\/(?:dataset|transactions|coverage|review-groups|income-overview)(?:$|\?)/.test(path)
+    || /^\/categories\/overview(?:$|\?)/.test(path)
+    || /^\/reports(?:$|\/|\?)/.test(path);
+  if (!isScoped || selectedBank === 'all') return `${API_BASE_URL}${path}`;
+  const url = new URL(`${API_BASE_URL}${path}`);
+  url.searchParams.set('bank', selectedBank);
+  return url.toString();
+}
 
 async function request(path, options = {}) {
-  const response = await fetch(`${API_BASE_URL}${path}`, options);
+  const response = await fetch(scopedUrl(path), options);
 
   if (!response.ok) {
     let message = `Request failed (${response.status})`;
@@ -22,6 +34,9 @@ async function request(path, options = {}) {
 
 export const api = {
   baseUrl: API_BASE_URL,
+
+  setBankScope(value) { selectedBank = value || 'all'; },
+  getBankScope() { return selectedBank; },
 
   health() {
     return request('/health');
@@ -55,7 +70,7 @@ export const api = {
     return request('/assistant/ask', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ ...payload, bank: selectedBank }),
     });
   },
 
@@ -64,7 +79,7 @@ export const api = {
   },
 
   getTransactions() {
-    return request('/transactions');
+    return request('/transactions', { cache: 'no-store' });
   },
 
   getStatements() {
@@ -96,7 +111,7 @@ export const api = {
   },
 
   getReports() {
-    return request('/reports');
+    return request('/reports', { cache: 'no-store' });
   },
 
   getCustomReport(start, end) {
@@ -143,6 +158,26 @@ export const api = {
 
   getCategories() {
     return request('/categories');
+  },
+
+  getCategoryOverview() {
+    return request('/categories/overview', { cache: 'no-store' });
+  },
+
+  renameCategory(source, name) {
+    return request(`/categories/${encodeURIComponent(source)}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name }),
+    });
+  },
+
+  mergeCategories(source, target) {
+    return request('/categories/merge', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source, target }),
+    });
+  },
+
+  deleteCategory(name) {
+    return request(`/categories/${encodeURIComponent(name)}`, { method: 'DELETE' });
   },
 
   getRules() { return request('/naming-rules'); },

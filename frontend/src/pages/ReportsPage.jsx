@@ -46,13 +46,21 @@ function monthBounds(monthKey) {
 }
 
 
-export default function ReportsPage({ transactions, reporting, refreshReports, setPage }) {
+export default function ReportsPage({ transactions, reporting, refreshReports, refreshTransactions, setPage }) {
   const months = reporting?.monthly || [];
   const availableMonths = reporting?.availableMonths || months.map((item) => ({ month: item.month, label: item.label }));
+  const years = reporting?.availableYears || [...new Set(months.map((month) => Number(month.month.slice(0, 4))))].sort();
+  const latestYear = years.length ? years[years.length - 1] : null;
+  const annualReports = reporting?.yearly || [];
   const payCycles = reporting?.payCycles || [];
   const overallSavings = reporting?.savings || {};
 
   const [reportMode, setReportMode] = useState('calendar');
+  const [selectedYear, setSelectedYear] = useState('latest');
+  const activeYear = selectedYear === 'all' ? null : (selectedYear === 'latest' ? latestYear : Number(selectedYear));
+  const yearMonths = activeYear ? months.filter((month) => month.month.startsWith(`${activeYear}-`)) : months;
+  const yearAvailableMonths = activeYear ? availableMonths.filter((month) => month.month.startsWith(`${activeYear}-`)) : availableMonths;
+  const yearReport = annualReports.find((entry) => entry.year === activeYear);
   const [selectedMonth, setSelectedMonth] = useState('latest');
   const [selectedCycle, setSelectedCycle] = useState('latest');
   const [includePartialMonths, setIncludePartialMonths] = useState(false);
@@ -64,21 +72,23 @@ export default function ReportsPage({ transactions, reporting, refreshReports, s
   const [explorerReport, setExplorerReport] = useState(null);
   const [explorerLoading, setExplorerLoading] = useState(false);
   const [explorerError, setExplorerError] = useState('');
+  const [correctingSavings, setCorrectingSavings] = useState(false);
+  const [savingsCorrectionError, setSavingsCorrectionError] = useState('');
 
 
   useEffect(() => {
-    if (selectedMonth !== 'latest' && !months.some((item) => item.month === selectedMonth)) setSelectedMonth('latest');
-  }, [months, selectedMonth]);
+    if (selectedMonth !== 'latest' && !yearMonths.some((item) => item.month === selectedMonth)) setSelectedMonth('latest');
+  }, [yearMonths, selectedMonth]);
 
   useEffect(() => {
     if (selectedCycle !== 'latest' && !payCycles.some((item) => item.id === selectedCycle)) setSelectedCycle('latest');
   }, [payCycles, selectedCycle]);
 
   const activeMonth = useMemo(() => {
-    if (!months.length) return null;
-    if (selectedMonth === 'latest') return months[months.length - 1];
-    return months.find((item) => item.month === selectedMonth) || months[months.length - 1];
-  }, [months, selectedMonth]);
+    if (!yearMonths.length) return null;
+    if (selectedMonth === 'latest') return yearMonths[yearMonths.length - 1];
+    return yearMonths.find((item) => item.month === selectedMonth) || yearMonths[yearMonths.length - 1];
+  }, [yearMonths, selectedMonth]);
 
   const activeCycle = useMemo(() => {
     if (!payCycles.length) return null;
@@ -99,6 +109,17 @@ export default function ReportsPage({ transactions, reporting, refreshReports, s
 
   const allMonthOptions = reporting?.allMonthsComparison || {};
   const allMonths = includePartialMonths ? allMonthOptions.includingPartial : allMonthOptions.completeOnly;
+  const yearScopedMonths = useMemo(() => {
+    if (!allMonths || activeYear === null) return allMonths;
+    const rows = (allMonths.months || []).filter((item) => String(item.month).startsWith(`${activeYear}-`));
+    const points = (allMonths.categoryTrend?.points || []).filter((item) => String(item.month).startsWith(`${activeYear}-`));
+    const categories = (allMonths.categoryTrend?.categories || []).filter((category) =>
+      points.some((point) => Number(point.values?.[category] || 0) > 0));
+    return { ...allMonths, months: rows, categoryTrend: { categories, points } };
+  }, [allMonths, activeYear]);
+  const scopedIncompleteMonths = activeYear === null
+    ? Boolean(allMonthOptions.hasPartialMonths)
+    : yearMonths.some((item) => item.coverageStatus === 'partial');
 
   // The selected reporting method controls the entire page. Calendar mode uses
   // calendar months; pay-cycle mode uses salary-to-salary periods everywhere,
@@ -106,9 +127,9 @@ export default function ReportsPage({ transactions, reporting, refreshReports, s
   const periodComparison = useMemo(() => {
     if (reportMode === 'calendar') {
       return {
-        periods: allMonths?.months || [],
-        trend: allMonths?.categoryTrend || { categories: [], points: [] },
-        hasIncompletePeriods: Boolean(allMonthOptions.hasPartialMonths),
+        periods: yearScopedMonths?.months || [],
+        trend: yearScopedMonths?.categoryTrend || { categories: [], points: [] },
+        hasIncompletePeriods: scopedIncompleteMonths,
       };
     }
 
@@ -139,7 +160,7 @@ export default function ReportsPage({ transactions, reporting, refreshReports, s
       trend: { categories, points },
       hasIncompletePeriods: payCycles.some((cycle) => !cycle.complete),
     };
-  }, [reportMode, allMonths, allMonthOptions.hasPartialMonths, payCycles, includePartialMonths]);
+  }, [reportMode, yearScopedMonths, scopedIncompleteMonths, payCycles, includePartialMonths]);
 
   const matrixPeriods = periodComparison.periods;
   const matrixTrend = periodComparison.trend;
@@ -195,7 +216,7 @@ export default function ReportsPage({ transactions, reporting, refreshReports, s
         if (!cancelled) setExplorerLoading(false);
       });
     return () => { cancelled = true; };
-  }, [periodBounds?.start, periodBounds?.end, filterCategory, filterMerchant, filterRole]);
+  }, [periodBounds?.start, periodBounds?.end, filterCategory, filterMerchant, filterRole, transactions]);
 
   const comparisonHasPartial = reportMode === 'calendar'
     ? (activeMonth?.coverageStatus === 'partial'
@@ -204,6 +225,32 @@ export default function ReportsPage({ transactions, reporting, refreshReports, s
 
   const categoryChanges = (comparison?.categoryChanges || []).filter((item) => Number(item.changeAmount) !== 0).slice(0, 4);
   const currentSavings = Number(summary?.netSavingsMovement || 0);
+  const periodSavingsEntries = summary?.savingsEntries || [];
+
+  const correctSavingsRoles = async () => {
+    const ids = overallSavings.savingsCorrectableIds || [];
+    if (!ids.length) return;
+    const confirmed = window.confirm(
+      `Mark ${ids.length} outgoing transaction${ids.length === 1 ? '' : 's'} categorised as Savings as transfers? `
+      + 'This will remove them from expense totals and include them in savings reporting.'
+    );
+    if (!confirmed) return;
+    setCorrectingSavings(true);
+    setSavingsCorrectionError('');
+    try {
+      await api.updateTransactionsBatch(ids, {
+        financialRole: 'transfer',
+        roleConfidence: 'high',
+        roleReason: 'Confirmed as savings transfer by user',
+        humanVerified: true,
+      });
+      await (refreshTransactions ? refreshTransactions() : refreshReports?.());
+    } catch (error) {
+      setSavingsCorrectionError(error.message || 'Could not correct the savings transactions.');
+    } finally {
+      setCorrectingSavings(false);
+    }
+  };
 
   const clearExplorerFilters = () => {
     setFilterCategory('');
@@ -242,7 +289,7 @@ export default function ReportsPage({ transactions, reporting, refreshReports, s
     ? `conic-gradient(${pieSegments.map((item) => `${item.colour} ${item.start}% ${item.end}%`).join(', ')})`
     : '#eef1f4';
 
-  const latestMonth = months[months.length - 1];
+  const latestMonth = yearMonths[yearMonths.length - 1];
   const latestCycle = payCycles[payCycles.length - 1];
   const matrixColumnTotals = matrixTrend.points.map((point) => (
     matrixTrend.categories.reduce((total, category) => total + Number(point.values?.[category] || 0), 0)
@@ -277,6 +324,22 @@ export default function ReportsPage({ transactions, reporting, refreshReports, s
             </select>
           </label>
 
+          {reportMode === 'calendar' && (
+            <label>
+              <span>Year</span>
+              <select aria-label="Reporting year" value={selectedYear} onChange={(event) => {
+                setSelectedYear(event.target.value);
+                setSelectedMonth('latest');
+                clearExplorerFilters();
+              }}>
+                <option value="latest">Latest · {latestYear || 'year'}</option>
+                {[...years].reverse().filter((year) => year !== latestYear).map((year) => (
+                  <option key={year} value={String(year)}>{year}</option>
+                ))}
+                <option value="all">All years</option>
+              </select>
+            </label>
+          )}
           <label>
             <span>Period</span>
             {reportMode === 'calendar' ? (
@@ -285,7 +348,7 @@ export default function ReportsPage({ transactions, reporting, refreshReports, s
                 clearExplorerFilters();
               }}>
                 <option value="latest">Latest · {latestMonth?.label || 'month'}</option>
-                {[...availableMonths].reverse().filter((month) => month.month !== latestMonth?.month).map((month) => (
+                {[...yearAvailableMonths].reverse().filter((month) => month.month !== latestMonth?.month).map((month) => (
                   <option key={month.month} value={month.month}>{month.label}</option>
                 ))}
               </select>
@@ -307,6 +370,29 @@ export default function ReportsPage({ transactions, reporting, refreshReports, s
           </label>
         </div>
       </nav>
+
+      {reportMode === 'calendar' && yearReport && (
+        <section className="report-period-kpis-section report-year-summary" aria-label={`${activeYear} annual financial summary`}>
+          <div className="report-section-heading-row">
+            <div>
+              <span className="eyebrow">Calendar year</span>
+              <h2>{activeYear} year overview</h2>
+              <p>Totals from transactions dated in {activeYear}, not the year the statement was issued.</p>
+            </div>
+          </div>
+          {!yearReport.complete && (
+            <div className="report-data-warning" role="status">
+              Partial-year data: only {yearReport.coveredDays} of {yearReport.days} days ({percentage(yearReport.coveragePct)}) are covered by imported statements. These are recorded totals, not a full-year estimate.
+            </div>
+          )}
+          <div className="report-key-grid report-kpi-grid-large">
+            <article className="report-key-metric"><span>Income in {activeYear}</span><strong>{currency(yearReport.income)}</strong><small>Recognised income</small></article>
+            <article className="report-key-metric"><span>Spending in {activeYear}</span><strong>{currency(yearReport.spending)}</strong><small>Confirmed expenses</small></article>
+            <article className="report-key-metric"><span>After expenses</span><strong className={yearReport.netCashFlow >= 0 ? 'amount-positive' : 'amount-negative'}>{currency(yearReport.netCashFlow)}</strong><small>Income + refunds − spending</small></article>
+            <article className="report-key-metric"><span>Net savings transfers</span><strong>{currency(yearReport.netSavingsMovement)}</strong><small>Transfers in minus withdrawals, not account balance</small></article>
+          </div>
+        </section>
+      )}
 
       {reportMode === 'pay_cycle' && !payCycles.length && (
         <section className="content-card report-empty-action">
@@ -412,28 +498,79 @@ export default function ReportsPage({ transactions, reporting, refreshReports, s
           <button className="secondary-button compact-button" type="button" onClick={() => setPage?.('budget')}>Open Budget</button>
         </div>
 
+        {Number(overallSavings.savingsUncountedCount || 0) > 0 && (
+          <div className="savings-report-notice" role="status">
+            <div>
+              <strong>{overallSavings.savingsUncountedCount} savings-categorised transaction{overallSavings.savingsUncountedCount === 1 ? '' : 's'} not included</strong>
+              <p>These are labelled Savings but their money movement is not Transfer. Only savings transfers affect the totals; automatically detected transfers are labelled provisional. {Number(overallSavings.savingsUncountedCount || 0) > (overallSavings.savingsCorrectableIds || []).length ? 'Incoming payments or other roles need individual review.' : ''}</p>
+            </div>
+            {(overallSavings.savingsCorrectableIds || []).length > 0 && (
+              <button className="secondary-button compact-button" type="button" disabled={correctingSavings} onClick={correctSavingsRoles}>
+                {correctingSavings ? 'Updating…' : `Count ${overallSavings.savingsCorrectableIds.length} as savings transfers`}
+              </button>
+            )}
+          </div>
+        )}
+        {savingsCorrectionError && <div className="inline-alert error" role="alert">{savingsCorrectionError}</div>}
+
         <div className="savings-metric-grid savings-metric-grid-large">
           <div>
-            <span>Overall net savings</span>
+            <span>Net savings transfers · all history</span>
             <strong className={Number(overallSavings.netSavingsMovement || 0) >= 0 ? 'amount-positive' : 'amount-negative'}>{currency(overallSavings.netSavingsMovement || 0)}</strong>
-            <small>All recognised savings transfers across your imported history</small>
+            <small>{overallSavings.savingsTransactionCount || 0} movements · {overallSavings.savingsUnconfirmedCount || 0} automatically inferred</small>
           </div>
           <div>
-            <span>{activeLabel || 'Selected period'} savings</span>
+            <span>{activeLabel || 'Selected period'} net transfers</span>
             <strong className={currentSavings >= 0 ? 'amount-positive' : 'amount-negative'}>{currency(currentSavings)}</strong>
-            <small>Money moved into savings minus money moved back</small>
+            <small>{summary?.savingsTransactionCount || 0} movements · {summary?.savingsUnconfirmedCount || 0} automatically inferred</small>
           </div>
           <div>
-            <span>Overall savings rate</span>
+            <span>Overall net transfer rate</span>
             <strong>{overallSavings.savingsTransferRatePct === null || overallSavings.savingsTransferRatePct === undefined ? '—' : percentage(overallSavings.savingsTransferRatePct)}</strong>
-            <small>Share of recognised income moved into savings overall</small>
+            <small>Net savings transfers (after withdrawals) ÷ recognised income</small>
           </div>
           <div>
-            <span>Selected-period savings rate</span>
+            <span>Selected-period net transfer rate</span>
             <strong>{summary?.savingsTransferRatePct === null || summary?.savingsTransferRatePct === undefined ? '—' : percentage(summary.savingsTransferRatePct)}</strong>
-            <small>{summary?.income ? "Share of this period's income moved into savings" : 'No recognised income in this period'}</small>
+            <small>{summary?.income ? 'Net transfers after withdrawals ÷ period income' : 'No recognised income in this period'}</small>
           </div>
         </div>
+
+        <p className="muted-copy">These figures track transfers to and from savings, not the balance of a savings account. Transfers detected from bank descriptions are provisional until you confirm them in Transactions.</p>
+        {Number(overallSavings.savingsUnconfirmedCount || 0) > 0 && (
+          <div className="savings-report-notice" role="status">
+            <div>
+              <strong>{overallSavings.savingsUnconfirmedCount} automatically detected movement{overallSavings.savingsUnconfirmedCount === 1 ? '' : 's'} need review</strong>
+              <p>Some transfers were identified using bank descriptions rather than a manual confirmation. You can correct their direction or exclude them in Transactions.</p>
+            </div>
+            <button type="button" className="secondary-button compact-button" onClick={() => setPage?.('transactions')}>Review transactions</button>
+          </div>
+        )}
+        <details className="savings-entry-details">
+          <summary>See which transactions are included in {activeLabel || 'this period'} ({periodSavingsEntries.length})</summary>
+          {periodSavingsEntries.length ? (
+            <div className="savings-entry-list">
+              {[...periodSavingsEntries].reverse().map((entry, index) => (
+                <div className="savings-entry-row" key={entry.id || `${entry.date}-${index}`}>
+                  <div>
+                    <strong>{entry.name}</strong>
+                    <small>{entry.date ? shortDate(entry.date) : 'Undated'} · {entry.category} · {entry.confirmed ? 'Confirmed' : 'Automatically detected — review'}</small>
+                  </div>
+                  <strong className={Number(entry.savingsEffect) >= 0 ? 'amount-positive' : 'amount-negative'}>
+                    {signedCurrency(entry.savingsEffect)}
+                  </strong>
+                </div>
+              ))}
+              <p className="muted-copy">Positive contributions add to savings; withdrawals reduce the total. Confirm the direction of any automatically detected movement in Transactions.</p>
+            </div>
+          ) : (
+            <div className="savings-entry-empty">
+              <p>No confirmed savings transfers were found in the selected {reportMode === 'pay_cycle' ? 'pay cycle' : 'calendar month'}.</p>
+              <p>Edit the transaction, select Transfer, and mark its Savings movement as money added or money withdrawn. Check that its date falls in this period.</p>
+              <button className="secondary-button compact-button" type="button" onClick={() => setPage?.('transactions')}>Review transactions</button>
+            </div>
+          )}
+        </details>
       </section>
 
       {summary && (
@@ -466,9 +603,9 @@ export default function ReportsPage({ transactions, reporting, refreshReports, s
               <small>Income + refunds − spending</small>
             </article>
             <article className="report-key-metric">
-              <span>Net saved</span>
+              <span>Net transfers to savings</span>
               <strong className={currentSavings >= 0 ? 'amount-positive' : 'amount-negative'}>{currency(currentSavings)}</strong>
-              <small>Transfers into savings minus money moved back</small>
+              <small>Only identified transfers, not your total savings balance</small>
             </article>
             <article className="report-key-metric">
               <span>Spent vs income</span>

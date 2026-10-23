@@ -104,6 +104,8 @@ class Database:
                     duplicate_count INTEGER NOT NULL DEFAULT 0,
                     period_start TEXT,
                     period_end TEXT,
+                    period_source TEXT NOT NULL DEFAULT '',
+                    period_header TEXT NOT NULL DEFAULT '',
                     file_hash TEXT NOT NULL DEFAULT ''
                 );
 
@@ -118,6 +120,7 @@ class Database:
                     category_confidence TEXT NOT NULL DEFAULT 'unknown',
                     category_reason TEXT NOT NULL DEFAULT '',
                     financial_role TEXT NOT NULL DEFAULT 'unknown',
+                    savings_direction TEXT NOT NULL DEFAULT '',
                     role_confidence TEXT NOT NULL DEFAULT 'unknown',
                     role_reason TEXT NOT NULL DEFAULT '',
                     amount REAL,
@@ -242,6 +245,7 @@ class Database:
                 ("category_confidence", "TEXT NOT NULL DEFAULT 'unknown'"),
                 ("category_reason", "TEXT NOT NULL DEFAULT ''"),
                 ("financial_role", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("savings_direction", "TEXT NOT NULL DEFAULT ''"),
                 ("role_confidence", "TEXT NOT NULL DEFAULT 'unknown'"),
                 ("role_reason", "TEXT NOT NULL DEFAULT ''"),
                 ("human_verified", "INTEGER NOT NULL DEFAULT 0"),
@@ -260,6 +264,8 @@ class Database:
                 ("duplicate_count", "INTEGER NOT NULL DEFAULT 0"),
                 ("period_start", "TEXT"),
                 ("period_end", "TEXT"),
+                ("period_source", "TEXT NOT NULL DEFAULT ''"),
+                ("period_header", "TEXT NOT NULL DEFAULT ''"),
                 ("file_hash", "TEXT NOT NULL DEFAULT ''"),
             ):
                 self._ensure_column(connection, "statements", column, definition)

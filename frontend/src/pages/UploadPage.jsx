@@ -123,7 +123,7 @@ export default function UploadPage({
                 <span className="statement-file-icon"><FileText size={18} /></span>
                 <div className="statement-copy">
                   <strong>{statement.filename}</strong>
-                  <span>{statement.bank} · {formatRange(statement.periodStart, statement.periodEnd)}</span>
+                  <span>{statement.bank} · {formatRange(statement.periodStart, statement.periodEnd)}{statement.periodVerified ? ' · Verified PDF period' : ' · Legacy date range (unverified)'}</span>
                   <small>
                     {statement.importedCount ?? statement.transactionCount} new transaction{(statement.importedCount ?? statement.transactionCount) === 1 ? '' : 's'}
                     {statement.duplicateCount ? ` · ${statement.duplicateCount} overlapping transaction${statement.duplicateCount === 1 ? '' : 's'} linked` : ''}
@@ -206,7 +206,7 @@ export default function UploadPage({
             <>
               <strong>Select a statement</strong>
               <span>It will be added to your existing WalletWise history</span>
-              <small>FNB PDF statements · max 20 MB</small>
+              <small>FNB or Capitec PDF statements · max 20 MB</small>
             </>
           )}
         </div>
@@ -253,6 +253,9 @@ export default function UploadPage({
             <span className="success-icon"><Check size={18} /></span>
             <div>
               <strong>{result.importedCount} new transactions added</strong>
+              {result.periodDetection?.verified && (
+                <p>Statement period verified: {formatRange(result.periodDetection.start, result.periodDetection.end)} · {result.periodDetection.source}</p>
+              )}
               <p>
                 {result.bank} · {result.filename}
                 {result.duplicateCount ? ` · ${result.duplicateCount} overlap${result.duplicateCount === 1 ? '' : 's'} safely linked` : ''}
@@ -269,7 +272,7 @@ export default function UploadPage({
         <div className="pipeline-steps">
           {[
             ['1', 'Detect bank', 'Choose the matching bank adapter.'],
-            ['2', 'Extract & OCR', 'Read rows and recover visual-only descriptions.'],
+            ['2', 'Verify period & extract', 'Read FNB header dates, resolve transaction years and recover visual-only descriptions.'],
             ['3', 'Normalise', 'Convert bank fields into the common WalletWise schema.'],
             ['4', 'De-duplicate', 'Link overlaps instead of counting the same transaction twice.'],
             ['5', 'Append & report', 'Keep earlier months and extend your financial history.'],

@@ -21,3 +21,4 @@ class ExtractionResult:
     page_counts: dict[int, int] = field(default_factory=dict)
     unassigned_rows: list[UnassignedRow] = field(default_factory=list)
     debug_files: list[str] = field(default_factory=list)
+    statement_period: dict | None = None

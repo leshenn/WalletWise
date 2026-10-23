@@ -53,8 +53,8 @@ class FNBTransactionBuilder:
         transaction.y1 = max(transaction.y1, row.y1)
         transaction.ocr_used = transaction.ocr_used or row.ocr_used
 
-    def build(self, rows: list[FNBRawRow], start_year: int):
-        resolver = DateResolver(start_year, self.config.date_order)
+    def build(self, rows: list[FNBRawRow], start_year: int, statement_period=None):
+        resolver = DateResolver(start_year, self.config.date_order, statement_period=statement_period)
         transactions = []
         orphan_rows = []
 
@@ -89,7 +89,7 @@ class FNBTransactionBuilder:
             if has_explicit_date:
                 resolved_date = resolver.resolve(row.date)
                 if resolved_date is None:
-                    orphan_rows.append((row, "Invalid transaction date"))
+                    orphan_rows.append((row, resolver.last_error or "Invalid transaction date"))
                     continue
 
                 transaction = self._make_draft(row, resolved_date, row.date)

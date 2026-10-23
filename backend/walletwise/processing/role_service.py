@@ -66,6 +66,11 @@ class FinancialRoleService:
         return None
 
     def classify_transaction(self, transaction: Transaction) -> Transaction:
+        # Some bank adapters have explicit financial roles from statement fields;
+        # never replace a verified transfer or posted bank fee with sign heuristics.
+        if transaction.role_confidence == "high" and transaction.financial_role in {"transfer", "expense", "refund"}:
+            return transaction
+
         # Closing balance is not a real financial movement.
         if transaction.transaction_type == "closing_balance":
             transaction.financial_role = "balance"
@@ -80,6 +85,23 @@ class FinancialRoleService:
         searchable = " ".join(
             part for part in (transaction.raw_description, transaction.display_name) if part
         )
+
+        # A savings-account bank charge isn't money saved. Likewise credited
+        # interest is income, not a withdrawal from savings. These must be
+        # resolved before the broad "savings" transfer wording check.
+        if re.search(r'\bsavings?\b', searchable, flags=re.IGNORECASE):
+            if re.search(r'\b(?:fees?|service\s+charges?|monthly\s+charges?)\b', searchable, flags=re.IGNORECASE) and transaction.amount is not None and transaction.amount < 0:
+                transaction.financial_role = 'expense'
+                transaction.role_confidence = 'high'
+                transaction.role_reason = 'Savings account fee is an expense, not a savings transfer.'
+                if transaction.category == 'Uncategorised':
+                    transaction.category = 'Bank Fees'
+                return transaction
+            if re.search(r'\binterest\b', searchable, flags=re.IGNORECASE) and transaction.amount is not None and transaction.amount > 0:
+                transaction.financial_role = 'income'
+                transaction.role_confidence = 'medium'
+                transaction.role_reason = 'Credited savings interest is income, not a transfer out of savings.'
+                return transaction
 
         matched = self._matches(self.TRANSFER_PATTERNS, searchable)
         if matched:

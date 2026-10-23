@@ -9,6 +9,7 @@ class TransactionUpdate(BaseModel):
     categoryConfidence: str | None = None
     categoryReason: str | None = None
     financialRole: str | None = None
+    savingsDirection: str | None = Field(default=None, pattern='^(into|out|none|auto)$')
     roleConfidence: str | None = None
     roleReason: str | None = None
     namingConfidence: str | None = None
@@ -55,6 +56,7 @@ class BatchTransactionUpdate(BaseModel):
     categoryConfidence: str | None = None
     categoryReason: str | None = None
     financialRole: str | None = None
+    savingsDirection: str | None = Field(default=None, pattern='^(into|out|none|auto)$')
     roleConfidence: str | None = None
     roleReason: str | None = None
     namingConfidence: str | None = None
@@ -104,6 +106,7 @@ class AIHistoryMessage(BaseModel):
 
 
 class AIAskPayload(BaseModel):
+    bank: str | None = None  # all / FNB / Capitec; server validates
     question: str = Field(min_length=2, max_length=2000)
     history: list[AIHistoryMessage] = Field(default_factory=list, max_length=4)
     conversationId: str | None = Field(default=None, max_length=80)

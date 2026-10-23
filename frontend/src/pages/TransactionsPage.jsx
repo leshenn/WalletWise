@@ -8,7 +8,8 @@ import {
   WalletCards,
   X,
 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import ConfidenceBadge from '../components/ConfidenceBadge';
 import { api } from '../services/api';
 import { currency, shortDate } from '../utils/formatters';
@@ -23,8 +24,10 @@ function roleLabel(value) {
   })[value] || 'Unknown';
 }
 
-function TransactionEditModal({ transaction, categories = [], saving, onClose, onSave }) {
-  const [form, setForm] = useState({ displayName: '', category: 'Uncategorised', financialRole: 'unknown' });
+function TransactionEditModal({ transaction, categories = [], saving, error, onClose, onSave }) {
+  const modalRef = useRef(null);
+  const nameInputRef = useRef(null);
+  const [form, setForm] = useState({ displayName: '', category: 'Uncategorised', financialRole: 'unknown', savingsDirection: 'auto' });
 
   useEffect(() => {
     if (!transaction) return;
@@ -32,17 +35,37 @@ function TransactionEditModal({ transaction, categories = [], saving, onClose, o
       displayName: transaction.displayName || '',
       category: transaction.category || 'Uncategorised',
       financialRole: transaction.financialRole || 'unknown',
+      savingsDirection: transaction.savingsDirection || (
+        (transaction.category || '').trim().toLowerCase() === 'savings'
+          && transaction.financialRole === 'transfer'
+          ? (Number(transaction.amount) < 0 ? 'into' : 'out') : 'auto'
+      ),
     });
   }, [transaction]);
 
-  useEffect(() => {
+  // Use the browser's top-layer dialog instead of a CSS-positioned overlay.
+  // It is always centred in the CURRENT viewport, even at the bottom of a
+  // long transaction page or inside an animated/transformed app shell.
+  useLayoutEffect(() => {
     if (!transaction) return undefined;
-    const onKey = (event) => {
-      if (event.key === 'Escape' && !saving) onClose?.();
+    const dialog = modalRef.current;
+    if (!dialog) return undefined;
+    const previouslyFocused = document.activeElement;
+    const previousHtmlOverflow = document.documentElement.style.overflow;
+    const previousBodyOverflow = document.body.style.overflow;
+
+    dialog.showModal();
+    document.documentElement.style.overflow = 'hidden';
+    document.body.style.overflow = 'hidden';
+    nameInputRef.current?.focus({ preventScroll: true });
+
+    return () => {
+      if (dialog.open) dialog.close();
+      document.documentElement.style.overflow = previousHtmlOverflow;
+      document.body.style.overflow = previousBodyOverflow;
+      if (previouslyFocused?.isConnected) previouslyFocused.focus({ preventScroll: true });
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [transaction, saving, onClose]);
+  }, [transaction?.id]);
 
   if (!transaction) return null;
 
@@ -58,31 +81,47 @@ function TransactionEditModal({ transaction, categories = [], saving, onClose, o
       displayName: form.displayName.trim() || transaction.displayName || transaction.rawDescription || 'Transaction',
       category: form.category,
       financialRole: form.financialRole,
+      savingsDirection: form.financialRole === 'transfer' ? form.savingsDirection : 'none',
       namingConfidence: 'high',
       nameReason: 'Edited by user',
       categoryConfidence: 'high',
-      categoryReason: 'Edited by user',
+      categoryReason: form.category !== (transaction.category || 'Uncategorised')
+        ? 'Edited by user'
+        : (transaction.categoryReason || ''),
       roleConfidence: 'high',
-      roleReason: 'Edited by user',
+      roleReason: form.financialRole !== (transaction.financialRole || 'unknown')
+        ? 'Edited by user'
+        : (transaction.roleReason || ''),
       reviewReasons: [],
       humanVerified: true,
     });
   };
 
-  return (
-    <div
-      className="transaction-edit-backdrop"
-      role="presentation"
+  return createPortal(
+    <dialog
+      ref={modalRef}
+      className="transaction-edit-modal"
+      aria-labelledby="transaction-edit-title"
+      aria-describedby="transaction-edit-description"
+      onCancel={(event) => {
+        // Escape should close the editor, unless a save is in progress.
+        event.preventDefault();
+        if (!saving) onClose?.();
+      }}
       onMouseDown={(event) => {
-        if (event.target === event.currentTarget && !saving) onClose?.();
+        // Only treat a pointer press OUTSIDE the dialog rectangle as a backdrop click.
+        const bounds = event.currentTarget.getBoundingClientRect();
+        const outside = event.clientX < bounds.left || event.clientX > bounds.right
+          || event.clientY < bounds.top || event.clientY > bounds.bottom;
+        if (outside && !saving) onClose?.();
       }}
     >
-      <form className="transaction-edit-modal" onSubmit={submit}>
+      <form onSubmit={submit}>
         <div className="transaction-edit-heading">
           <div>
             <span className="eyebrow">Correct a transaction</span>
-            <h2>Edit transaction</h2>
-            <p>Your original bank description and extracted amount stay unchanged.</p>
+            <h2 id="transaction-edit-title">Edit transaction</h2>
+            <p id="transaction-edit-description">Your original bank description and extracted amount stay unchanged.</p>
           </div>
           <button type="button" className="icon-button transaction-edit-close" onClick={onClose} disabled={saving} aria-label="Close transaction editor">
             <X size={18} />
@@ -108,6 +147,7 @@ function TransactionEditModal({ transaction, categories = [], saving, onClose, o
           <label>
             <span>Friendly name</span>
             <input
+              ref={nameInputRef}
               value={form.displayName}
               onChange={(event) => setForm((current) => ({ ...current, displayName: event.target.value }))}
               placeholder="Transaction name"
@@ -117,14 +157,30 @@ function TransactionEditModal({ transaction, categories = [], saving, onClose, o
 
           <label>
             <span>Category</span>
-            <select value={form.category} onChange={(event) => setForm((current) => ({ ...current, category: event.target.value }))}>
+            <select value={form.category} onChange={(event) => setForm((current) => ({
+              ...current,
+              category: event.target.value,
+              // Choosing either Savings or an ordinary Transfer categorises the
+              // movement as a transfer. Only Savings should change the savings ledger.
+              financialRole: ['savings', 'transfer', 'transfers'].includes(event.target.value.trim().toLowerCase())
+                ? 'transfer' : current.financialRole,
+              savingsDirection: event.target.value.trim().toLowerCase() === 'savings'
+                ? (Number(transaction.amount) < 0 ? 'into' : 'out')
+                : current.category.trim().toLowerCase() === 'savings' ? 'none' : current.savingsDirection,
+            }))}>
               {categoryOptions.map((item) => <option key={item} value={item}>{item}</option>)}
             </select>
           </label>
 
           <label>
             <span>Money movement</span>
-            <select value={form.financialRole} onChange={(event) => setForm((current) => ({ ...current, financialRole: event.target.value }))}>
+            <select value={form.financialRole} onChange={(event) => setForm((current) => ({
+              ...current, financialRole: event.target.value,
+              savingsDirection: event.target.value === 'transfer'
+                ? (current.category.trim().toLowerCase() === 'savings' && ['none', 'auto'].includes(current.savingsDirection)
+                  ? (Number(transaction.amount) < 0 ? 'into' : 'out') : current.savingsDirection)
+                : 'none',
+            }))}>
               <option value="expense">Expense</option>
               <option value="income">Income</option>
               <option value="transfer">Transfer</option>
@@ -135,11 +191,36 @@ function TransactionEditModal({ transaction, categories = [], saving, onClose, o
           </label>
         </div>
 
+        {form.financialRole === 'transfer' && form.savingsDirection === 'none' && (
+          <div className="transaction-edit-note" role="status">
+            This is an ordinary transfer. It will not add to or subtract from your Savings report.
+          </div>
+        )}
+        {form.financialRole === 'transfer' && (
+          <label className="transaction-savings-direction">
+            <span>Savings movement</span>
+            <select value={form.savingsDirection} onChange={(event) => setForm((current) => ({ ...current, savingsDirection: event.target.value }))}>
+              <option value="into">Money added to savings (+)</option>
+              <option value="out">Money taken from savings (−)</option>
+              <option value="none">Not a savings transfer</option>
+              <option value="auto">Not confirmed — detect from bank description</option>
+            </select>
+            <small>Choose what actually happened. The transaction amount's sign doesn't always tell the full story.</small>
+          </label>
+        )}
+        {form.category.trim().toLowerCase() === 'savings' && form.financialRole !== 'transfer' && (
+          <div className="transaction-edit-note" role="status">
+            This is labelled Savings but is not a Transfer, so it will not count as a savings movement.
+          </div>
+        )}
+
         {transaction.isSalary && form.financialRole !== 'income' && (
           <div className="transaction-edit-note">
             Changing this away from Income will also remove it as a salary/pay-cycle anchor.
           </div>
         )}
+
+        {error && <div className="inline-alert error" role="alert">{error}</div>}
 
         <div className="transaction-edit-actions">
           <button type="button" className="secondary-button" onClick={onClose} disabled={saving}>Cancel</button>
@@ -148,7 +229,8 @@ function TransactionEditModal({ transaction, categories = [], saving, onClose, o
           </button>
         </div>
       </form>
-    </div>
+    </dialog>,
+    document.body
   );
 }
 
@@ -355,6 +437,7 @@ export default function TransactionsPage({ transactions, refreshTransactions, ca
   const [editingTransaction, setEditingTransaction] = useState(null);
   const [transactionSaving, setTransactionSaving] = useState(false);
   const [error, setError] = useState('');
+  const [transactionNotice, setTransactionNotice] = useState('');
 
   const categoryOptions = ['All', ...new Set(transactions.map((t) => t.category).filter(Boolean))];
   const filtered = useMemo(() => transactions.filter((transaction) => {
@@ -431,13 +514,34 @@ export default function TransactionsPage({ transactions, refreshTransactions, ca
   const saveTransaction = async (transaction, payload) => {
     setTransactionSaving(true);
     setError('');
+    setTransactionNotice('');
+    let saved;
     try {
-      await api.updateTransaction(transaction.id, payload);
-      await refreshTransactions?.();
-      setEditingTransaction(null);
+      saved = await api.updateTransaction(transaction.id, payload);
     } catch (err) {
       setError(err.message || 'Could not save the transaction changes.');
+      setTransactionSaving(false);
+      return;
+    }
+
+    // A successful PATCH has persisted the edit even if the subsequent report
+    // reload fails. Don't invite a duplicate save or incorrectly say it failed.
+    try {
+      const refreshed = await refreshTransactions?.();
+      const entries = refreshed?.reporting?.savings?.savingsEntries;
+      const counted = Array.isArray(entries) && entries.some((item) => item.id === transaction.id);
+      const category = (saved?.category || '').trim().toLowerCase();
+      if (category === 'savings' && saved?.financialRole === 'transfer' && Array.isArray(entries) && !counted) {
+        setTransactionNotice('Transaction saved, but the report did not count it as savings. Check that your backend is updated, then reload Reports.');
+      } else if (category === 'savings' && saved?.financialRole !== 'transfer') {
+        setTransactionNotice('Transaction saved. Savings-category transactions only count when Money movement is Transfer.');
+      } else {
+        setTransactionNotice('Transaction saved. Reports were refreshed with the latest data.');
+      }
+    } catch (err) {
+      setTransactionNotice('Transaction saved, but the reports could not refresh. Reload Reports or check the backend connection.');
     } finally {
+      setEditingTransaction(null);
       setTransactionSaving(false);
     }
   };
@@ -465,6 +569,7 @@ export default function TransactionsPage({ transactions, refreshTransactions, ca
       </div>
 
       {error && <div className="inline-alert error">{error}</div>}
+      {transactionNotice && <div className="inline-alert" role="status">{transactionNotice}</div>}
 
       {activeTab === 'salary' ? (
         <section className="content-card income-salary-section">
@@ -583,7 +688,7 @@ export default function TransactionsPage({ transactions, refreshTransactions, ca
                       <td>{transaction.bank}</td>
                       <td><ConfidenceBadge level={transaction.namingConfidence} /></td>
                       <td>
-                        <button className="transaction-edit-button" onClick={() => setEditingTransaction(transaction)} aria-label={`Edit ${transaction.displayName || 'transaction'}`}>
+                        <button className="transaction-edit-button" onClick={() => { setError(''); setEditingTransaction(transaction); }} aria-label={`Edit ${transaction.displayName || 'transaction'}`}>
                           <Pencil size={14} /> Edit
                         </button>
                       </td>
@@ -605,7 +710,7 @@ export default function TransactionsPage({ transactions, refreshTransactions, ca
                         <WalletCards size={14} /> {transaction.isSalary ? 'Used as salary' : transaction.salaryExcluded ? 'Restore salary' : 'Use as salary'}
                       </button>
                     )}
-                    <button className="transaction-edit-button mobile" onClick={() => setEditingTransaction(transaction)}>
+                    <button className="transaction-edit-button mobile" onClick={() => { setError(''); setEditingTransaction(transaction); }}>
                       <Pencil size={14} /> Edit transaction
                     </button>
                   </div>
@@ -621,6 +726,7 @@ export default function TransactionsPage({ transactions, refreshTransactions, ca
         transaction={editingTransaction}
         categories={categories}
         saving={transactionSaving}
+        error={error}
         onClose={() => !transactionSaving && setEditingTransaction(null)}
         onSave={saveTransaction}
       />
